@@ -1,71 +1,119 @@
-name: ZIL Tooling Space Builder
+name: ZIL Hardened Tooling Builder
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch: # Memungkinkan eksekusi manual
+  workflow_dispatch:
 
 jobs:
-  build-tooling:
-    runs-on: macos-latest
+  build:
+    runs-on: macos-15 # Menggunakan macOS 15 untuk Xcode 16 stabil
+    env:
+      SDK_VERSION: "18.0"
+      ZIL_BIN_DIR: "${{ github.workspace }}/tools/bin"
+      ZIL_RUST_SRC: "${{ github.workspace }}/core/executor/src"
     
     steps:
-      - name: Checkout ZIL Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Setup Swift & Xcode
+      - name: Validate Filesystem
+        run: |
+          mkdir -p "$ZIL_BIN_DIR"
+          # Pastikan file entitlements ada sebelum mulai, kalau tidak ada: GAGALKAN
+          if [ ! -f "core/executor/entitlements.xml" ]; then
+            echo "::error::entitlements.xml not found! Build aborted."
+            exit 1
+          fi
+
+      - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '16.0' # Memastikan SDK iOS 18 tersedia
+          xcode-version: '16.0'
 
-      - name: Install Dependencies
+      - name: Install System Dependencies
         run: |
           brew install ldid
-          # Menyiapkan folder output sesuai struktur ZIL
-          mkdir -p tools/bin
+          # Pastikan Python3 memiliki module hashlib (bawaan biasanya aman)
 
-      # --- 1. BUILD TOYBOX ---
-      - name: Fetch & Build Toybox
+      # --- 1. COMPILE TOYBOX (THE POSIX ENGINE) ---
+      - name: Build Toybox
         run: |
-          git clone https://github.com/landley/toybox.git
+          git clone --depth 1 https://github.com/landley/toybox.git
           cd toybox
-          # Konfigurasi cross-compile untuk iOS
-          # Kita menggunakan target arm64-apple-ios18.0
+          
+          # Dapatkan Path SDK iOS secara dinamis
+          IPHONEOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          echo "[+] Compiling Toybox for iOS ${{ env.SDK_VERSION }}..."
+          
+          # Gunakan CC yang benar-benar menunjuk ke Clang Xcode
+          export CC=$(xcrun --sdk iphoneos -find clang)
+          export CFLAGS="-arch arm64 -isysroot $IPHONEOS_SDK -miphoneos-version-min=${{ env.SDK_VERSION }} -O3"
+          
           make macos_defconfig
-          PREFIX=../tools/bin/ LDFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=18.0" \
-          CFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=18.0" \
-          make toybox
-          cp toybox ../tools/bin/toybox_brutal.bin
+          
+          # Kompilasi manual untuk kontrol penuh
+          $CC $CFLAGS -o toybox_brutal.bin main.c lib/*.c toys/*/*.c -I . \
+          -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+          
+          mv toybox_brutal.bin "$ZIL_BIN_DIR/"
           cd ..
 
-      # --- 2. BUILD ELLEKIT ---
-      - name: Fetch & Build ElleKit
+      # --- 2. COMPILE ELLEKIT (THE HOOKING ENGINE) ---
+      - name: Build ElleKit
         run: |
           git clone --recursive https://github.com/mcaollo/ElleKit.git
           cd ElleKit
-          # Kompilasi ElleKit menggunakan Swift Package Manager untuk target iOS
-          swift build -c release --triple arm64-apple-ios18.0
-          cp .build/release/libElleKit.dylib ../tools/bin/ellekit.dylib
+          
+          echo "[+] Compiling ElleKit via SwiftPM..."
+          # Build khusus untuk arm64-apple-ios
+          swift build -c release --triple arm64-apple-ios${{ env.SDK_VERSION }}
+          
+          # Cari dylib hasil build (lokasi SwiftPM bisa bervariasi)
+          DYLIB_PATH=$(find .build -name "libElleKit.dylib" | head -n 1)
+          
+          if [ -z "$DYLIB_PATH" ]; then
+             echo "::error::ElleKit dylib not found!"
+             exit 1
+          fi
+          
+          cp "$DYLIB_PATH" "$ZIL_BIN_DIR/ellekit.dylib"
           cd ..
 
-      # --- 3. SIGNING & ENTITLEMENTS ---
-      - name: Apply Entitlements & Codesign
+      # --- 3. HARDENED SIGNING (THE PASSPORT) ---
+      - name: Apply Entitlements
         run: |
-          # Menggunakan file entitlements.xml yang telah kita buat sebelumnya
-          # ldid akan menyuntikkan izin sandbox escape dan platform-binary
-          ldid -Score/executor/entitlements.xml tools/bin/toybox_brutal.bin
-          ldid -Score/executor/entitlements.xml tools/bin/ellekit.dylib
+          cd "$ZIL_BIN_DIR"
+          echo "[+] Injecting Entitlements into binaries..."
+          
+          # Tanda tangani Toybox
+          ldid -S"${{ github.workspace }}/core/executor/entitlements.xml" toybox_brutal.bin
+          
+          # Tanda tangani ElleKit
+          ldid -S"${{ github.workspace }}/core/executor/entitlements.xml" ellekit.dylib
+          
+          # Verifikasi singkat
+          ls -l
 
-      # --- 4. CDHASH EXTRACTION ---
-      - name: Run ZIL CDHash Extractor
+      # --- 4. CDHASH SYNC (THE KERNEL KEY) ---
+      - name: Run Mach-O CDHash Extractor
         run: |
-          # Menjalankan skrip Python yang sudah dirombak total (Mach-O Parser)
-          python3 tools/build_cdhash_list.py
+          # Pastikan script python menggunakan path absolut agar tidak bingung
+          python3 "${{ github.workspace }}/tools/build_cdhash_list.py"
+          
+          if [ ! -f "$ZIL_RUST_SRC/trusted_hashes.rs" ]; then
+            echo "::error::trusted_hashes.rs was not generated!"
+            exit 1
+          fi
 
-      - name: Upload Artifacts
+      - name: Archive Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zil-tooling-space
+          name: ZIL-Tooling-Pack
           path: |
             tools/bin/
             core/executor/src/trusted_hashes.rs
+          if-no-files-found: error
