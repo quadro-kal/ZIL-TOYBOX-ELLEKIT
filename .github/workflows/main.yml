@@ -1,4 +1,4 @@
-name: ZIL Master Builder v3
+name: ZIL Hybrid Builder (Upstream + Procursus Logic)
 
 on:
   push:
@@ -15,57 +15,51 @@ jobs:
       - name: Setup Toolchain
         run: |
           brew install ldid
-          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
           mkdir -p tools/bin
+          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
-      # --- TAHAP 1: BANGUN TOYBOX (THE CLEAN METHOD) ---
-      - name: Build Toybox
+      - name: Build Toybox (Upstream Source)
         run: |
+          # 1. Ambil Sumber dari Upstream (Official)
           git clone --depth 1 https://github.com/landley/toybox.git
           cd toybox
-          
-          # Setup Variable Tanpa Digabung (Biar tidak error 'No file found')
+
+          # 2. Implementasi Logika dari toybox.mk (Procursus)
           export CC=$(xcrun --sdk iphoneos -find clang)
-          export SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          export CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -O3"
+          export SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          echo "[+] Step 1: Membuat Konfigurasi..."
+          # CFLAGS Khusus untuk iOS 18+ sesuai standar Procursus
+          export CFLAGS="-arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=18.0 -O3 -flto"
+          
+          echo "[+] Step 1: Konfigurasi Darwin/MacOS..."
           make macos_defconfig
           
-          echo "[+] Step 2: Membuat Header (config.h)..."
-          # Paksa generate headers lewat script internal
-          if [ -f "scripts/gen_config.sh" ]; then
-            bash scripts/gen_config.sh
-          fi
-          
-          echo "[+] Step 3: Kompilasi Manual (Otot iOS)..."
-          # Kita panggil clang langsung agar tidak ada drama spasi di Makefile
-          $CC $CFLAGS -I . -I ./lib -o toybox_brutal.bin main.c lib/*.c toys/*/*.c
+          echo "[+] Step 2: Patching (Procursus Style)..."
+          # Kita pastikan genconfig.sh berjalan untuk menciptakan config.h
+          GEN_SCRIPT=$(find scripts -name "gen*config.sh" | head -n 1)
+          bash "$GEN_SCRIPT"
+
+          echo "[+] Step 3: Kompilasi Manual..."
+          # Memasukkan include ke folder generated secara paksa agar tidak error
+          $CC $CFLAGS -I . -I ./lib -I ./generated -o toybox_brutal.bin main.c lib/*.c toys/*/*.c
           
           cp toybox_brutal.bin ../tools/bin/
-          echo "[+] Toybox Berhasil Dibangun."
+          echo "[+] Build Hybrid Berhasil."
 
-      # --- TAHAP 2: SIGNING (JALUR AMAN) ---
-      - name: Codesign
+      - name: Sign and Sync CDHash
         run: |
-          # Cari entitlements.xml dimanapun dia berada
+          # Menggunakan entitlements.xml yang sudah Anda push
           ENT=$(find . -name "entitlements.xml" | head -n 1)
-          if [ -z "$ENT" ]; then
-            echo "::error::entitlements.xml TIDAK ADA! Pastikan sudah di git add."
-            exit 1
-          fi
           ldid -S"$ENT" tools/bin/toybox_brutal.bin
-
-      # --- TAHAP 3: SYNC CDHASH ---
-      - name: Sync Hash
-        run: |
+          
+          # Ekstraksi hash untuk Kernel Trust Cache
           PY=$(find . -name "build_cdhash_list.py" | head -n 1)
           python3 "$PY"
 
-      - name: Save Artifact
+      - name: Archive ZIL Payload
         uses: actions/upload-artifact@v4
         with:
-          name: ZIL-Payload
+          name: ZIL-Hybrid-Payload
           path: |
             tools/bin/
             core/executor/src/trusted_hashes.rs
