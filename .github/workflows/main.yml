@@ -19,7 +19,7 @@ jobs:
           # Pastikan SDK iOS 18 tersedia
           sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
-      # --- TAHAP 1: TOYBOX BRUTAL BUILD ---
+   # --- TAHAP 1: BANGUN TOYBOX (THE "NO-ERROR" EDITION) ---
       - name: Build Toybox
         run: |
           git clone --depth 1 https://github.com/landley/toybox.git
@@ -30,19 +30,36 @@ jobs:
           export SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           export CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -O3 -I ."
           
-          echo "[+] Menghasilkan Headers secara Paksa..."
-          # Kita gunakan skrip internal toybox untuk generate config
+          echo "[+] Mencari skrip generator..."
+          # Kita cari di mana gen_config.sh berada
+          GEN_CONFIG=$(find . -name "gen_config.sh" | head -n 1)
+          
+          if [ -z "$GEN_CONFIG" ]; then
+            echo "::error::gen_config.sh BENERAN ILANG! Cek repo toybox-nya."
+            ls -R # Intip struktur folder buat debug
+            exit 1
+          fi
+          
+          echo "[+] Menghasilkan konfigurasi dan headers..."
           make macos_defconfig
-          # Ini akan membuat generated/config.h tanpa perlu target 'headers'
-          ./scripts/gen_config.sh
+          
+          # Paksa eksekusi pake 'bash' (biar gak peduli izin eksekusi +x)
+          bash "$GEN_CONFIG"
+          
+          # Toybox butuh satu skrip lagi buat flags
+          GEN_FLAGS=$(find . -name "gen_flags.sh" | head -n 1)
+          if [ -n "$GEN_FLAGS" ]; then
+            bash "$GEN_FLAGS"
+          fi
           
           echo "[+] Memulai Kompilasi Manual..."
-          # Kita kompilasi langsung tanpa 'make' untuk menghindari error Makefile
-          $CC $CFLAGS -o toybox_brutal.bin main.c lib/*.c toys/*/*.c -D_FORTIFY_SOURCE=2
+          # Tambahkan include ke folder generated secara eksplisit
+          mkdir -p generated
+          $CC $CFLAGS -I . -I ./lib -I ./generated -o toybox_brutal.bin main.c lib/*.c toys/*/*.c
           
           cp toybox_brutal.bin ../tools/bin/
           echo "[+] Toybox Build Sukses."
-
+          
       # --- TAHAP 2: SIGNING DENGAN VALIDASI JALUR ---
       - name: Codesign Tooling
         run: |
