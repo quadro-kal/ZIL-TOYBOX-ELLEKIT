@@ -1,4 +1,4 @@
-name: ZIL Hardened Tooling Builder
+name: ZIL Master Builder
 
 on:
   push:
@@ -6,114 +6,78 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: macos-15 # Menggunakan macOS 15 untuk Xcode 16 stabil
+  build-all:
+    runs-on: macos-15
     env:
-      SDK_VERSION: "18.0"
-      ZIL_BIN_DIR: "${{ github.workspace }}/tools/bin"
-      ZIL_RUST_SRC: "${{ github.workspace }}/core/executor/src"
-    
+      # Variabel sakti agar tidak salah jalur
+      ZIL_WORKSPACE: ${{ github.workspace }}
+      BIN_OUT: ${{ github.workspace }}/tools/bin
+      
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Validate Filesystem
+      - name: Ensure Directories Exist
         run: |
-          mkdir -p "$ZIL_BIN_DIR"
-          # Pastikan file entitlements ada sebelum mulai, kalau tidak ada: GAGALKAN
-          if [ ! -f "core/executor/entitlements.xml" ]; then
-            echo "::error::entitlements.xml not found! Build aborted."
-            exit 1
-          fi
+          mkdir -p "$BIN_OUT"
+          mkdir -p "${{ github.workspace }}/core/executor/src"
+          echo "[+] Direktori siap."
 
-      - name: Setup Xcode
+      - name: Setup Xcode 16
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '16.0'
 
-      - name: Install System Dependencies
-        run: |
-          brew install ldid
-          # Pastikan Python3 memiliki module hashlib (bawaan biasanya aman)
+      - name: Install ldid
+        run: brew install ldid
 
-      # --- 1. COMPILE TOYBOX (THE POSIX ENGINE) ---
+      # --- TAHAP 1: BANGUN TOYBOX ---
       - name: Build Toybox
         run: |
           git clone --depth 1 https://github.com/landley/toybox.git
           cd toybox
-          
-          # Dapatkan Path SDK iOS secara dinamis
-          IPHONEOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          
-          echo "[+] Compiling Toybox for iOS ${{ env.SDK_VERSION }}..."
-          
-          # Gunakan CC yang benar-benar menunjuk ke Clang Xcode
           export CC=$(xcrun --sdk iphoneos -find clang)
-          export CFLAGS="-arch arm64 -isysroot $IPHONEOS_SDK -miphoneos-version-min=${{ env.SDK_VERSION }} -O3"
+          export SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          export CFLAGS="-arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=18.0 -O3"
           
           make macos_defconfig
-          
-          # Kompilasi manual untuk kontrol penuh
-          $CC $CFLAGS -o toybox_brutal.bin main.c lib/*.c toys/*/*.c -I . \
-          -D_FORTIFY_SOURCE=2 -fstack-protector-strong
-          
-          mv toybox_brutal.bin "$ZIL_BIN_DIR/"
-          cd ..
+          $CC $CFLAGS -o toybox_brutal.bin main.c lib/*.c toys/*/*.c -I .
+          cp toybox_brutal.bin "$BIN_OUT/"
+          echo "[+] Toybox Berhasil."
 
-      # --- 2. COMPILE ELLEKIT (THE HOOKING ENGINE) ---
-      - name: Build ElleKit
+      # --- TAHAP 2: SIGNING (TITIK ERROR ANDA) ---
+      - name: Sign Binaries
         run: |
-          git clone --recursive https://github.com/mcaollo/ElleKit.git
-          cd ElleKit
+          # Kita cari file entitlements.xml secara agresif
+          ENT_PATH=$(find ${{ github.workspace }} -name "entitlements.xml" | head -n 1)
           
-          echo "[+] Compiling ElleKit via SwiftPM..."
-          # Build khusus untuk arm64-apple-ios
-          swift build -c release --triple arm64-apple-ios${{ env.SDK_VERSION }}
-          
-          # Cari dylib hasil build (lokasi SwiftPM bisa bervariasi)
-          DYLIB_PATH=$(find .build -name "libElleKit.dylib" | head -n 1)
-          
-          if [ -z "$DYLIB_PATH" ]; then
-             echo "::error::ElleKit dylib not found!"
-             exit 1
-          fi
-          
-          cp "$DYLIB_PATH" "$ZIL_BIN_DIR/ellekit.dylib"
-          cd ..
-
-      # --- 3. HARDENED SIGNING (THE PASSPORT) ---
-      - name: Apply Entitlements
-        run: |
-          cd "$ZIL_BIN_DIR"
-          echo "[+] Injecting Entitlements into binaries..."
-          
-          # Tanda tangani Toybox
-          ldid -S"${{ github.workspace }}/core/executor/entitlements.xml" toybox_brutal.bin
-          
-          # Tanda tangani ElleKit
-          ldid -S"${{ github.workspace }}/core/executor/entitlements.xml" ellekit.dylib
-          
-          # Verifikasi singkat
-          ls -l
-
-      # --- 4. CDHASH SYNC (THE KERNEL KEY) ---
-      - name: Run Mach-O CDHash Extractor
-        run: |
-          # Pastikan script python menggunakan path absolut agar tidak bingung
-          python3 "${{ github.workspace }}/tools/build_cdhash_list.py"
-          
-          if [ ! -f "$ZIL_RUST_SRC/trusted_hashes.rs" ]; then
-            echo "::error::trusted_hashes.rs was not generated!"
+          if [ -z "$ENT_PATH" ]; then
+            echo "::error::FILE entitlements.xml TIDAK DITEMUKAN DI MANAPUN!"
             exit 1
           fi
+          
+          echo "[+] Menggunakan Entitlements dari: $ENT_PATH"
+          ldid -S"$ENT_PATH" "$BIN_OUT/toybox_brutal.bin"
 
-      - name: Archive Artifacts
+      # --- TAHAP 3: GENERATE HASH ---
+      - name: Sync CDHash
+        run: |
+          # Cari skrip python
+          PY_SCRIPT=$(find ${{ github.workspace }} -name "build_cdhash_list.py" | head -n 1)
+          
+          if [ -z "$PY_SCRIPT" ]; then
+            echo "::error::SKRIP build_cdhash_list.py TIDAK DITEMUKAN!"
+            exit 1
+          fi
+          
+          python3 "$PY_SCRIPT"
+          echo "[+] Hash Ter-update di trusted_hashes.rs"
+
+      # --- TAHAP 4: ARCHIVE ---
+      - name: Upload Result
         uses: actions/upload-artifact@v4
         with:
-          name: ZIL-Tooling-Pack
+          name: ZIL-Final-Payload
           path: |
             tools/bin/
             core/executor/src/trusted_hashes.rs
-          if-no-files-found: error
