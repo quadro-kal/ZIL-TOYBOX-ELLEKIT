@@ -1,4 +1,4 @@
-name: ZIL Master Builder
+name: ZIL Master Builder v2
 
 on:
   push:
@@ -6,97 +6,68 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-all:
+  build:
     runs-on: macos-15
-    env:
-      # Variabel sakti agar tidak salah jalur
-      ZIL_WORKSPACE: ${{ github.workspace }}
-      BIN_OUT: ${{ github.workspace }}/tools/bin
-      
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Ensure Directories Exist
+      - name: Setup Environment
         run: |
-          mkdir -p "$BIN_OUT"
-          mkdir -p "${{ github.workspace }}/core/executor/src"
-          echo "[+] Direktori siap."
+          brew install ldid
+          mkdir -p tools/bin
+          # Pastikan SDK iOS 18 tersedia
+          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
-      - name: Setup Xcode 16
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: '16.0'
-
-      - name: Install ldid
-        run: brew install ldid
-
-    # --- TAHAP 1: BANGUN TOYBOX (REVISI ANTI-ERROR) ---
+      # --- TAHAP 1: TOYBOX BRUTAL BUILD ---
       - name: Build Toybox
         run: |
           git clone --depth 1 https://github.com/landley/toybox.git
           cd toybox
           
-          # Setup Environment
+          # Setup Toolchain
           export CC=$(xcrun --sdk iphoneos -find clang)
-          export SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          export CFLAGS="-arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=18.0 -O3"
+          export SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          export CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -O3 -I ."
           
-          echo "[+] Menjalankan Konfigurasi..."
-          # Pastikan host compiler (untuk tools build) tersedia
+          echo "[+] Menghasilkan Headers secara Paksa..."
+          # Kita gunakan skrip internal toybox untuk generate config
           make macos_defconfig
+          # Ini akan membuat generated/config.h tanpa perlu target 'headers'
+          ./scripts/gen_config.sh
           
-          echo "[+] Memaksa pembuatan Generated Headers..."
-          # INI KUNCINYA: Membuat file generated/config.h dkk
-          make headers
+          echo "[+] Memulai Kompilasi Manual..."
+          # Kita kompilasi langsung tanpa 'make' untuk menghindari error Makefile
+          $CC $CFLAGS -o toybox_brutal.bin main.c lib/*.c toys/*/*.c -D_FORTIFY_SOURCE=2
           
-          # Cek apakah file benar-benar ada sebelum lanjut
-          if [ ! -f "generated/config.h" ]; then
-            echo "::error::generated/config.h MASIH TIDAK DITEMUKAN!"
-            exit 1
-          fi
+          cp toybox_brutal.bin ../tools/bin/
+          echo "[+] Toybox Build Sukses."
 
-          echo "[+] Compiling Toybox Brutal..."
-          # Kita gunakan perintah build internal toybox jika memungkinkan
-          # atau lanjut dengan manual build yang sudah diperbaiki jalurnya
-          $CC $CFLAGS -I . -I ./lib -o toybox_brutal.bin main.c lib/*.c toys/*/*.c
-          
-          mkdir -p "$BIN_OUT"
-          cp toybox_brutal.bin "$BIN_OUT/"
-          echo "[+] Toybox Berhasil dengan Headers."
-      # --- TAHAP 2: SIGNING (TITIK ERROR ANDA) ---
-      - name: Sign Binaries
+      # --- TAHAP 2: SIGNING DENGAN VALIDASI JALUR ---
+      - name: Codesign Tooling
         run: |
-          # Kita cari file entitlements.xml secara agresif
-          ENT_PATH=$(find ${{ github.workspace }} -name "entitlements.xml" | head -n 1)
+          # Cari file entitlements.xml secara dinamis agar tidak gagal
+          ENT_PATH=$(find . -name "entitlements.xml" | head -n 1)
           
           if [ -z "$ENT_PATH" ]; then
-            echo "::error::FILE entitlements.xml TIDAK DITEMUKAN DI MANAPUN!"
+            echo "::error::entitlements.xml tidak ditemukan di folder core/executor/!"
             exit 1
           fi
           
-          echo "[+] Menggunakan Entitlements dari: $ENT_PATH"
-          ldid -S"$ENT_PATH" "$BIN_OUT/toybox_brutal.bin"
+          echo "[+] Signing dengan: $ENT_PATH"
+          ldid -S"$ENT_PATH" tools/bin/toybox_brutal.bin
 
-      # --- TAHAP 3: GENERATE HASH ---
-      - name: Sync CDHash
+      # --- TAHAP 3: KRIPTOGRAFI CDHASH ---
+      - name: Sync Kernel Hashes
         run: |
-          # Cari skrip python
-          PY_SCRIPT=$(find ${{ github.workspace }} -name "build_cdhash_list.py" | head -n 1)
-          
-          if [ -z "$PY_SCRIPT" ]; then
-            echo "::error::SKRIP build_cdhash_list.py TIDAK DITEMUKAN!"
-            exit 1
-          fi
-          
+          PY_SCRIPT=$(find . -name "build_cdhash_list.py" | head -n 1)
           python3 "$PY_SCRIPT"
-          echo "[+] Hash Ter-update di trusted_hashes.rs"
+          echo "[+] trusted_hashes.rs telah diperbarui."
 
-      # --- TAHAP 4: ARCHIVE ---
-      - name: Upload Result
+      - name: Archive ZIL Payload
         uses: actions/upload-artifact@v4
         with:
-          name: ZIL-Final-Payload
+          name: ZIL-A19-Payload
           path: |
             tools/bin/
             core/executor/src/trusted_hashes.rs
