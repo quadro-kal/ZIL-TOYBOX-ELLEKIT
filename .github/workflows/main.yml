@@ -1,4 +1,4 @@
-name: ZIL Master Builder v2
+name: ZIL Master Builder v3
 
 on:
   push:
@@ -9,73 +9,63 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Environment
+      - name: Setup Toolchain
         run: |
           brew install ldid
-          mkdir -p tools/bin
-          # Pastikan SDK iOS 18 tersedia
           sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+          mkdir -p tools/bin
 
-  # --- TAHAP 1: BANGUN TOYBOX (MODERN MAKE METHOD) ---
+      # --- TAHAP 1: BANGUN TOYBOX (THE CLEAN METHOD) ---
       - name: Build Toybox
         run: |
           git clone --depth 1 https://github.com/landley/toybox.git
           cd toybox
           
-          # 1. Tentukan Compiler Host (macOS) dan Target (iOS)
-          export HOSTCC=clang
-          export CC="$(xcrun --sdk iphoneos -find clang)"
-          export SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          # Setup Variable Tanpa Digabung (Biar tidak error 'No file found')
+          export CC=$(xcrun --sdk iphoneos -find clang)
+          export SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          export CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -O3"
           
-          # 2. Set CFLAGS untuk iOS
-          export CFLAGS="-arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=18.0 -O3"
-          
-          echo "[+] Menjalankan Konfigurasi..."
+          echo "[+] Step 1: Membuat Konfigurasi..."
           make macos_defconfig
           
-          echo "[+] Memulai Kompilasi (Otomatis Handle Headers)..."
-          # KUNCINYA: Kita panggil 'make' tapi overide CC-nya.
-          # Toybox akan otomatis menjalankan scripts/make.sh secara internal.
-          make CC="$CC $CFLAGS" STRIP=echo
-          
-          # Hasil build Toybox biasanya bernama 'toybox' tanpa ekstensi
-          if [ -f "toybox" ]; then
-            cp toybox ../tools/bin/toybox_brutal.bin
-            echo "[+] Toybox Berhasil Dibangun."
-          else
-            echo "::error::Biner 'toybox' tidak ditemukan setelah 'make'!"
-            ls -F # Debug untuk lihat hasil build
-            exit 1
+          echo "[+] Step 2: Membuat Header (config.h)..."
+          # Paksa generate headers lewat script internal
+          if [ -f "scripts/gen_config.sh" ]; then
+            bash scripts/gen_config.sh
           fi
           
-      # --- TAHAP 2: SIGNING DENGAN VALIDASI JALUR ---
-      - name: Codesign Tooling
-        run: |
-          # Cari file entitlements.xml secara dinamis agar tidak gagal
-          ENT_PATH=$(find . -name "entitlements.xml" | head -n 1)
+          echo "[+] Step 3: Kompilasi Manual (Otot iOS)..."
+          # Kita panggil clang langsung agar tidak ada drama spasi di Makefile
+          $CC $CFLAGS -I . -I ./lib -o toybox_brutal.bin main.c lib/*.c toys/*/*.c
           
-          if [ -z "$ENT_PATH" ]; then
-            echo "::error::entitlements.xml tidak ditemukan di folder core/executor/!"
+          cp toybox_brutal.bin ../tools/bin/
+          echo "[+] Toybox Berhasil Dibangun."
+
+      # --- TAHAP 2: SIGNING (JALUR AMAN) ---
+      - name: Codesign
+        run: |
+          # Cari entitlements.xml dimanapun dia berada
+          ENT=$(find . -name "entitlements.xml" | head -n 1)
+          if [ -z "$ENT" ]; then
+            echo "::error::entitlements.xml TIDAK ADA! Pastikan sudah di git add."
             exit 1
           fi
-          
-          echo "[+] Signing dengan: $ENT_PATH"
-          ldid -S"$ENT_PATH" tools/bin/toybox_brutal.bin
+          ldid -S"$ENT" tools/bin/toybox_brutal.bin
 
-      # --- TAHAP 3: KRIPTOGRAFI CDHASH ---
-      - name: Sync Kernel Hashes
+      # --- TAHAP 3: SYNC CDHASH ---
+      - name: Sync Hash
         run: |
-          PY_SCRIPT=$(find . -name "build_cdhash_list.py" | head -n 1)
-          python3 "$PY_SCRIPT"
-          echo "[+] trusted_hashes.rs telah diperbarui."
+          PY=$(find . -name "build_cdhash_list.py" | head -n 1)
+          python3 "$PY"
 
-      - name: Archive ZIL Payload
+      - name: Save Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ZIL-A19-Payload
+          name: ZIL-Payload
           path: |
             tools/bin/
             core/executor/src/trusted_hashes.rs
