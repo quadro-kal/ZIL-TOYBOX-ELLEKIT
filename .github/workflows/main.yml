@@ -31,20 +31,39 @@ jobs:
       - name: Install ldid
         run: brew install ldid
 
-      # --- TAHAP 1: BANGUN TOYBOX ---
+    # --- TAHAP 1: BANGUN TOYBOX (REVISI ANTI-ERROR) ---
       - name: Build Toybox
         run: |
           git clone --depth 1 https://github.com/landley/toybox.git
           cd toybox
+          
+          # Setup Environment
           export CC=$(xcrun --sdk iphoneos -find clang)
           export SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           export CFLAGS="-arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=18.0 -O3"
           
+          echo "[+] Menjalankan Konfigurasi..."
+          # Pastikan host compiler (untuk tools build) tersedia
           make macos_defconfig
-          $CC $CFLAGS -o toybox_brutal.bin main.c lib/*.c toys/*/*.c -I .
-          cp toybox_brutal.bin "$BIN_OUT/"
-          echo "[+] Toybox Berhasil."
+          
+          echo "[+] Memaksa pembuatan Generated Headers..."
+          # INI KUNCINYA: Membuat file generated/config.h dkk
+          make headers
+          
+          # Cek apakah file benar-benar ada sebelum lanjut
+          if [ ! -f "generated/config.h" ]; then
+            echo "::error::generated/config.h MASIH TIDAK DITEMUKAN!"
+            exit 1
+          fi
 
+          echo "[+] Compiling Toybox Brutal..."
+          # Kita gunakan perintah build internal toybox jika memungkinkan
+          # atau lanjut dengan manual build yang sudah diperbaiki jalurnya
+          $CC $CFLAGS -I . -I ./lib -o toybox_brutal.bin main.c lib/*.c toys/*/*.c
+          
+          mkdir -p "$BIN_OUT"
+          cp toybox_brutal.bin "$BIN_OUT/"
+          echo "[+] Toybox Berhasil dengan Headers."
       # --- TAHAP 2: SIGNING (TITIK ERROR ANDA) ---
       - name: Sign Binaries
         run: |
